@@ -1,8 +1,8 @@
 {
-	"name": "wordpress/mcp-adapter",
+	"name": "tylerthedev819/mcp-adapter",
 	"description": "Adapter for Abilities API, letting WordPress abilities to be used as MCP tools, resources or prompts",
 	"license": "GPL-2.0-or-later",
-	"type": "library",
+	"type": "wordpress-plugin",
 	"keywords": [
 		"wordpress",
 		"mcp",
@@ -70,7 +70,8 @@
 		}
 	},
 	"require": {
-		"php": "^7.4 || ^8.0"
+		"php": "^7.4 || ^8.0",
+		"composer/installers": "^1.0 || ^2.0"
 	},
 	"require-dev": {
 		"automattic/vipwpcs": "^3.0",
