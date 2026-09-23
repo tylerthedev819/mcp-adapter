@@ -323,6 +323,13 @@ class McpTool {
 			? array( 'type' => 'object' )
 			: $this->input_schema;
 
+		// Normalize empty object schemas so JSON encodes {} rather than [].
+		// MCP requires inputSchema.properties to be an object; some abilities
+		// register 'properties' => array(), which PHP would emit as [].
+		if ( isset( $input_schema_for_json['properties'] ) && empty( $input_schema_for_json['properties'] ) ) {
+			$input_schema_for_json['properties'] = new \stdClass();
+		}
+
 		$tool_data = array(
 			'name'        => $this->name,
 			'description' => $this->description,
