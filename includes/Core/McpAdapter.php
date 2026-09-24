@@ -18,6 +18,7 @@ use WP\MCP\Infrastructure\ErrorHandling\NullMcpErrorHandler;
 use WP\MCP\Infrastructure\Observability\Contracts\McpObservabilityHandlerInterface;
 use WP\MCP\Infrastructure\Observability\NullMcpObservabilityHandler;
 use WP\MCP\Servers\DefaultServerFactory;
+use WP\MCP\Transport\HttpTransport;
 use WP_Error;
 
 // Exit if accessed directly.
@@ -303,6 +304,26 @@ final class McpAdapter {
 				'duplicate_server_id',
 				// translators: %s: server ID.
 				sprintf( esc_html__( 'Server with ID "%s" already exists.', 'mcp-adapter' ), esc_html( $server_id ) )
+			);
+		}
+
+		/**
+		 * Filters whether a server may expose the HTTP transport (a /wp-json REST route).
+		 *
+		 * Fork default: off. These sites connect over STDIO (`wp mcp-adapter serve` via SSH),
+		 * so no server gets a public endpoint unless this returns true for its ID.
+		 *
+		 * @param bool   $enabled   Whether to keep the HTTP transport. Default false.
+		 * @param string $server_id The server being created.
+		 */
+		if ( ! apply_filters( 'mcp_adapter_enable_http_transport', false, $server_id ) ) {
+			$mcp_transports = array_values(
+				array_filter(
+					$mcp_transports,
+					static function ( $transport ) {
+						return ! is_a( ltrim( (string) $transport, '\\' ), HttpTransport::class, true );
+					}
+				)
 			);
 		}
 
