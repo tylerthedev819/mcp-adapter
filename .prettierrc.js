@@ -14,10 +14,11 @@ const config = {
 			options: {
 				tabWidth: 2,
 				useTabs: false,
+				proseWrap: 'never',
 			},
 		},
 		{
-			files: ['*.yml', '*.yaml'],
+			files: [ '*.yml', '*.yaml' ],
 			options: {
 				tabWidth: 2,
 				useTabs: false,

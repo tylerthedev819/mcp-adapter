@@ -35,16 +35,41 @@
 		"preferred-install": "dist",
 		"allow-plugins": {
 			"automattic/jetpack-autoloader": true,
-			"composer/installers": true
+			"dealerdirect/phpcodesniffer-composer-installer": true,
+			"phpstan/extension-installer": true
 		}
 	},
 	"autoload": {
 		"psr-4": {
 			"WP\\MCP\\": "includes/"
+		},
+		"exclude-from-classmap": [
+			"tests/phpunit/"
+		]
+	},
+	"autoload-dev": {
+		"psr-4": {
+			"WP\\MCP\\Tests\\": [
+				"tests/phpunit/"
+			]
 		}
 	},
 	"require": {
 		"php": "^7.4 || ^8.0",
-		"composer/installers": "^1.0 || ^2.0"
+		"automattic/jetpack-autoloader": "^5.0",
+		"wordpress/php-mcp-schema": "^0.2.0",
+		"ext-json": "*"
+	},
+	"scripts": {
+		"format": "phpcbf",
+		"lint": "phpcs",
+		"phpstan": "phpstan analyse --memory-limit=1G",
+		"test": "phpunit --strict-coverage"
+	},
+	"scripts-descriptions": {
+		"format": "Automatically fix coding standards issues",
+		"lint": "Check coding standards compliance",
+		"phpstan": "Run static analysis with PHPStan",
+		"test": "Run PHPUnit tests"
 	}
 }

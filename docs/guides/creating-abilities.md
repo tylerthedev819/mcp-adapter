@@ -9,19 +9,42 @@ WordPress abilities can be registered as different MCP components:
 - **Resources**: Provide access to data or content
 - **Prompts**: Generate structured messages for language models
 
-** Full Annotation Support**: All component types support MCP annotations through the ability's `meta.annotations` field to provide behavior hints to MCP clients.
+**Full annotation support**: All component types support MCP annotations through the ability's `meta.annotations` field to provide behavior hints to MCP clients.
 
 ## MCP Exposure
 
-WordPress abilities are NOT accessible via default MCP server by default. To make an ability available through the default MCP server, you must explicitly add `mcp.public: true` to the ability's metadata.
+WordPress abilities are NOT accessible via the default MCP server by default. Set the high-level `meta.public` flag to `true` to make an ability available to clients, including MCP. An explicit `meta.mcp.public` value overrides that default for MCP only.
+
+```php
+'meta' => [
+    'public' => true, // Expose to clients, including MCP
+    'mcp' => [
+        'type'   => 'tool' // Optional: 'tool' (default), 'resource', or 'prompt'
+    ],
+    'annotations' => [...] // Optional MCP annotations
+]
+```
+
+> **Note**: How far `meta.public` reaches depends on the WordPress version. WordPress core starts applying `meta.public` to the REST API (`meta.show_in_rest`) in version 7.1. On WordPress 6.9 and 7.0, the MCP Adapter honors `meta.public` for MCP exposure, but REST API access still requires setting `meta.show_in_rest` to `true`.
+
+To keep an otherwise public ability out of MCP, opt out explicitly:
+
+```php
+'meta' => [
+    'public' => true,
+    'mcp' => [
+        'public' => false,
+    ],
+]
+```
+
+To expose an ability only through MCP without opting into other client channels, leave `meta.public` unset and opt into MCP explicitly:
 
 ```php
 'meta' => [
     'mcp' => [
-        'public' => true,  // Required for MCP access
-        'type'   => 'tool' // Optional: 'tool' (default), 'resource', or 'prompt'
+        'public' => true,
     ],
-    'annotations' => [...] // Optional MCP annotations
 ]
 ```
 
@@ -34,27 +57,97 @@ The `type` parameter specifies how the ability should be exposed in the MCP serv
 
 If not specified, abilities default to `type: 'tool'`.
 
+## Ability categories (required)
+
+Every ability **must** declare a `category`, and that category must already be registered when `wp_register_ability()` runs. If you omit `category` or use one that isn't registered, `wp_register_ability()` returns `null` and the ability never appears. There is no `WP_Error`; core calls `_doing_it_wrong()`, which only surfaces a PHP notice when `WP_DEBUG` is on. With `WP_DEBUG` off (typical on production) the failure looks completely silent.
+
+WordPress core registers two categories you can use right away: `site` and `user`.
+
+To use your own category, register it first on the `wp_abilities_api_categories_init` hook. Categories register on this hook; abilities register on `wp_abilities_api_init` — a separate, later hook. Register the category before any ability that references it:
+
+```php
+add_action( 'wp_abilities_api_categories_init', function () {
+    wp_register_ability_category( 'my-plugin', [
+        'label'       => 'My Plugin',
+        'description' => 'Abilities provided by My Plugin.',
+    ] );
+} );
+```
+
+Then reference the slug in your abilities: `'category' => 'my-plugin'`.
+
 ## Basic Ability Structure
 
 ```php
 wp_register_ability('my-plugin/my-ability', [
     'label' => 'My Ability',
     'description' => 'What this ability does',
+    'category' => 'site',         // Required. Must be a registered category (core: 'site', 'user').
     'input_schema' => [...],      // For tools (supports both object and flattened schemas)
     'output_schema' => [...],     // Optional for tools
     'execute_callback' => 'my_callback',
     'permission_callback' => 'my_permission_check',
     'meta' => [
+        'public' => true,          // Expose to clients, including MCP
         'annotations' => [...],   // MCP annotations
         'uri' => '...',          // For resources
         'arguments' => [...],    // For prompts
         'mcp' => [
-            'public' => true,    // Expose via MCP (required for MCP access)
             'type'   => 'tool',  // 'tool', 'resource', or 'prompt'
         ]
     ]
 ]);
 ```
+
+## Tool naming
+
+When abilities are registered on a custom server as MCP tools, the adapter must transform the ability name into an MCP-compliant tool name. The MCP specification (2025-11-25) restricts tool names to the characters `A-Za-z0-9_.-` with a maximum length of 128.
+
+WordPress abilities commonly use namespaced names with forward slashes (e.g., `my-plugin/my-tool`), which are not valid in MCP. The adapter handles this automatically via `McpNameSanitizer::sanitize_name()`.
+
+### Registration Name vs MCP Name
+
+The name you pass to `wp_register_ability()` is the **registration name**. The name MCP clients see is the **MCP tool name**, produced by sanitization:
+
+| Registration Name | MCP Tool Name |
+|-------------------|---------------|
+| `my-plugin/my-tool` | `my-plugin-my-tool` |
+| `fluent/get-posts` | `fluent-get-posts` |
+| `café/résumé-tool` | `cafe-resume-tool` |
+
+### Sanitization Pipeline
+
+The full sanitization pipeline applied to tool names:
+
+1. **Trim** whitespace from both ends
+2. **Replace `/` with `-`** (forward slashes are not allowed in MCP names)
+3. **Early return** if the name is already valid after slash replacement
+4. **Transliterate accents** to ASCII equivalents (e.g., `é` → `e`, `ü` → `u`) via WordPress `remove_accents()`
+5. **Replace remaining invalid characters** with `-`
+6. **Collapse consecutive hyphens** into a single `-`
+7. **Trim leading/trailing** hyphens and underscores
+8. **Truncate long names**: if longer than 128 characters, truncate to 115 characters and append `-` plus a 12-character MD5 hash for uniqueness
+9. **Reject empty results**: if nothing remains after sanitization, return a `WP_Error`
+
+### Customizing Tool Names
+
+You can override the sanitized name using the `mcp_adapter_tool_name` filter. The filter receives the sanitized name and the source `WP_Ability` instance:
+
+```php
+add_filter( 'mcp_adapter_tool_name', function ( string $name, \WP_Ability $ability ): string {
+    // Use a custom name for a specific ability.
+    if ( 'my-plugin/legacy-tool' === $ability->get_name() ) {
+        return 'my-legacy-tool';
+    }
+    return $name;
+}, 10, 2 );
+```
+
+The filter result is validated after application — if it returns an invalid MCP name, the tool registration fails with an error.
+
+> **Note:** This naming transformation applies to **tools created from WordPress abilities** (via `McpTool::fromAbility()`). The default server exposes abilities indirectly through its built-in meta-tools (`mcp-adapter-discover-abilities`, `mcp-adapter-get-ability-info`, `mcp-adapter-execute-ability`), so ability names pass through as-is in that context. Prompts use the same `McpNameSanitizer` logic. Resources use URIs as identifiers and are not affected by tool name sanitization.
+
+For advanced details, see the source: `includes/Domain/Utils/McpNameSanitizer.php`.
 
 ## Input and Output Schemas
 
@@ -369,10 +462,12 @@ Resources and Prompts share the same annotation schema per MCP specification:
 wp_register_ability('my-plugin/analyze-data', [
     'label' => 'Data Analyzer',
     'description' => 'Analyze data with various algorithms',
+    'category' => 'site',
     'input_schema' => [...],
     'execute_callback' => 'analyze_data_callback',
     'permission_callback' => function() { return current_user_can('read'); },
     'meta' => [
+        'public' => true,
         'annotations' => [
             'readonly' => true,              // WordPress format → readOnlyHint
             'destructive' => false,          // WordPress format → destructiveHint
@@ -381,7 +476,6 @@ wp_register_ability('my-plugin/analyze-data', [
             'title' => 'Data Analysis Tool'  // No WordPress equivalent
         ],
         'mcp' => [
-            'public' => true,
             'type' => 'tool'
         ]
     ]
@@ -391,9 +485,11 @@ wp_register_ability('my-plugin/analyze-data', [
 wp_register_ability('my-plugin/user-data', [
     'label' => 'User Data Resource',
     'description' => 'Access to user profile data',
+    'category' => 'user',
     'execute_callback' => 'get_user_data',
     'permission_callback' => function() { return current_user_can('read'); },
     'meta' => [
+        'public' => true,
         'uri' => 'wordpress://users/profile',
         'annotations' => [
             'audience' => ['assistant'],     // For AI use only
@@ -401,7 +497,6 @@ wp_register_ability('my-plugin/user-data', [
             'lastModified' => date('c')      // ISO 8601 timestamp
         ],
         'mcp' => [
-            'public' => true,
             'type' => 'resource'
         ]
     ]
@@ -411,6 +506,7 @@ wp_register_ability('my-plugin/user-data', [
 wp_register_ability('my-plugin/review-prompt', [
     'label' => 'Code Review Prompt',
     'description' => 'Generate structured code review prompts',
+    'category' => 'site',
     'input_schema' => [
         'type' => 'object',
         'properties' => [
@@ -421,13 +517,13 @@ wp_register_ability('my-plugin/review-prompt', [
     'execute_callback' => 'generate_review_prompt',
     'permission_callback' => function() { return current_user_can('edit_posts'); },
     'meta' => [
+        'public' => true,
         'annotations' => [
             'audience' => ['user', 'assistant'], // For both user and AI
             'priority' => 0.8,                  // High priority
             'lastModified' => date('c')          // Current timestamp
         ],
         'mcp' => [
-            'public' => true,
             'type' => 'prompt'
         ]
     ]
@@ -442,6 +538,7 @@ Tools execute actions and return results:
 wp_register_ability('my-plugin/create-post', [
     'label' => 'Create Post',
     'description' => 'Create a new WordPress post with the given title and content',
+    'category' => 'site',
     'input_schema' => [
         'type' => 'object',
         'properties' => [
@@ -486,13 +583,11 @@ wp_register_ability('my-plugin/create-post', [
         return current_user_can('publish_posts');
     },
     'meta' => [
+        'public' => true, // Expose to clients, including MCP
         'annotations' => [
             'readonly' => false,       // Tool modifies data (WordPress format)
             'destructive' => false,    // Tool doesn't delete data (WordPress format)
             'idempotent' => false      // Multiple calls create multiple posts (WordPress format)
-        ],
-        'mcp' => [
-            'public' => true  // Expose this ability via MCP
         ]
     ]
 ]);
@@ -506,6 +601,7 @@ For simple tools that accept and return single values, you can use flattened sch
 wp_register_ability('my-plugin/count-posts', [
     'label' => 'Count Posts',
     'description' => 'Count posts of a specific type',
+    'category' => 'site',
     'input_schema' => [
         'type' => 'string',
         'description' => 'Post type to count',
@@ -525,12 +621,10 @@ wp_register_ability('my-plugin/count-posts', [
         return current_user_can('read');
     },
     'meta' => [
+        'public' => true,
         'annotations' => [
             'readonly' => true,
             'idempotent' => false  // Count may change over time
-        ],
-        'mcp' => [
-            'public' => true
         ]
     ]
 ]);
@@ -549,6 +643,7 @@ Resources provide access to data or content. They require a `uri` in the meta fi
 wp_register_ability('my-plugin/site-config', [
     'label' => 'Site Configuration',
     'description' => 'WordPress site configuration and settings',
+    'category' => 'site',
     'execute_callback' => function() {
         return [
             'site_name' => get_bloginfo('name'),
@@ -562,6 +657,7 @@ wp_register_ability('my-plugin/site-config', [
         return current_user_can('manage_options');
     },
     'meta' => [
+        'public' => true, // Expose to clients, including MCP
         'uri' => 'wordpress://site/config',
         'annotations' => [
             'audience' => ['user', 'assistant'], // For both users and AI
@@ -569,7 +665,6 @@ wp_register_ability('my-plugin/site-config', [
             'lastModified' => '2024-01-15T10:30:00Z' // Last update timestamp
         ],
         'mcp' => [
-            'public' => true,      // Expose this ability via MCP
             'type'   => 'resource' // Mark as resource for auto-discovery
         ]
     ]
@@ -606,6 +701,7 @@ Prompts use standard JSON Schema `input_schema` to define their parameters. The 
 wp_register_ability('my-plugin/code-review', [
     'label' => 'Code Review Prompt',
     'description' => 'Generate a code review prompt with specific focus areas',
+    'category' => 'site',
     'input_schema' => [
         'type' => 'object',
         'properties' => [
@@ -642,12 +738,12 @@ wp_register_ability('my-plugin/code-review', [
         return current_user_can('edit_posts');
     },
     'meta' => [
+        'public' => true, // Expose to clients, including MCP
         'annotations' => [
             'audience' => ['user'],         // For user-facing prompts
             'priority' => 0.7               // Standard priority
         ],
         'mcp' => [
-            'public' => true,   // Expose this ability via MCP
             'type'   => 'prompt' // Mark as prompt for auto-discovery
         ]
     ]
@@ -662,6 +758,7 @@ You can also annotate the generated message content according to the [MCP specif
 wp_register_ability('my-plugin/analysis-prompt', [
     'label' => 'Analysis Prompt',
     'description' => 'Generate analysis prompts with content annotations',
+    'category' => 'site',
     'input_schema' => [
         'type' => 'object',
         'properties' => [
@@ -707,13 +804,13 @@ wp_register_ability('my-plugin/analysis-prompt', [
         return current_user_can('read');
     },
     'meta' => [
+        'public' => true, // Expose to clients, including MCP
         'annotations' => [
             'audience' => ['assistant'],        // For AI analysis only
             'priority' => 0.9,                 // High priority analysis
             'lastModified' => date('c')         // Current timestamp
         ],
         'mcp' => [
-            'public' => true,   // Expose this ability via MCP
             'type'   => 'prompt' // Mark as prompt for auto-discovery
         ]
     ]

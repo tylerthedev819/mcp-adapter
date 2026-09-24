@@ -1,6 +1,7 @@
 <?php
+
 /**
- * WordPress MCP Prompt class for representing MCP prompts according to the specification.
+ * MCP Prompt component.
  *
  * @package McpAdapter
  */
@@ -9,453 +10,378 @@ declare( strict_types=1 );
 
 namespace WP\MCP\Domain\Prompts;
 
-use WP\MCP\Core\McpServer;
+use WP\MCP\Domain\Contracts\McpComponentInterface;
+use WP\MCP\Domain\Prompts\Contracts\McpPromptBuilderInterface;
+use WP\MCP\Domain\Utils\AbilityArgumentNormalizer;
+use WP\MCP\Domain\Utils\RevisionProjectionTrait;
+use WP\MCP\Domain\Utils\ThrowableGuardTrait;
+use WP\MCP\Infrastructure\Observability\FailureReason;
+use WP\McpSchema\Record\Prompt;
+use WP\McpSchema\Schema;
+use WP_Error;
 
 /**
- * Represents an MCP prompt according to the Model Context Protocol specification.
+ * Prompt component providing unified execution and permission checks.
  *
- * Prompts provide structured messages and instructions for interacting with language models.
- * Each prompt is uniquely identified by a name and can include arguments for customization.
+ * This class supports multiple ways to register prompts:
  *
- * @link https://modelcontextprotocol.io/specification/2025-06-18/server/prompts
+ * 1. Array configuration:
+ * ```php
+ * $prompt = McpPrompt::fromArray([
+ *     'name'        => 'code-review',
+ *     'title'       => 'Code Review',
+ *     'description' => 'Generate a comprehensive code review',
+ *     'arguments'   => [
+ *         ['name' => 'code', 'description' => 'The code to review', 'required' => true],
+ *     ],
+ *     'handler'     => fn($args) => ['messages' => [...]],
+ *     'permission'  => fn() => true,
+ * ]);
+ * ```
+ *
+ * 2. From WordPress Ability (ability-backed):
+ * ```php
+ * $prompt = McpPrompt::fromAbility($ability);
+ * ```
+ *
+ * 3. From prompt builder (builder-backed compatibility):
+ * ```php
+ * $prompt = McpPrompt::fromBuilder($builder);
+ * ```
+ *
+ * McpPrompt stores revision-neutral configuration for MCP projection. Internal
+ * adapter metadata and execution wiring live on this class and are never
+ * exposed to MCP clients. Use get_protocol_record() for protocol responses.
+ *
+ * @since 0.5.0
  */
-class McpPrompt {
+final class McpPrompt implements McpComponentInterface {
+	use RevisionProjectionTrait;
+	use ThrowableGuardTrait;
+
+	// =========================================================================
+	// Runtime Properties
+	// =========================================================================
 
 	/**
-	 * The ability name.
+	 * Ability used for execution/permission checks (ability-backed prompts).
 	 *
-	 * @var string
+	 * @var \WP_Ability|null
 	 */
-	private string $ability;
+	private ?\WP_Ability $ability = null;
 
 	/**
-	 * Unique identifier for the prompt.
+	 * Builder instance (builder-backed prompts).
 	 *
-	 * @var string
+	 * @var \WP\MCP\Domain\Prompts\Contracts\McpPromptBuilderInterface|null
 	 */
-	private string $name;
+	private ?McpPromptBuilderInterface $builder = null;
 
 	/**
-	 * Optional human-readable name of the prompt for display purposes.
+	 * Direct execution handler (callable-backed prompts).
 	 *
-	 * @var string|null
+	 * @var callable|null
 	 */
-	private ?string $title;
+	private $handler = null;
 
 	/**
-	 * Optional human-readable description of the prompt.
+	 * Direct permission callback (callable-backed prompts).
 	 *
-	 * @var string|null
+	 * @var callable|null
 	 */
-	private ?string $description;
+	private $permission_callback = null;
 
 	/**
-	 * Optional list of arguments for prompt customization.
+	 * Internal adapter metadata (never exposed to clients).
 	 *
-	 * @var array
+	 * @var array<string, mixed>
 	 */
-	private array $arguments;
+	private array $adapter_meta = array();
 
 	/**
-	 * Optional properties describing prompt metadata.
+	 * Observability context tags for logging/metrics.
 	 *
-	 * @var array
+	 * @var array<string, mixed>
 	 */
-	private array $annotations;
+	private array $observability_context = array();
+
+	// =========================================================================
+	// Constructor
+	// =========================================================================
 
 	/**
-	 * The MCP server instance this prompt belongs to.
+	 * Private constructor - use factory methods.
 	 *
-	 * @var \WP\MCP\Core\McpServer|null
+	 * @param array<string, mixed> $prompt_data Revision-neutral prompt data.
 	 */
-	private ?McpServer $mcp_server = null;
+	private function __construct( array $prompt_data ) {
+		$this->initialize_protocol_data( $prompt_data );
+	}
+
+	// =========================================================================
+	// Factory Methods
+	// =========================================================================
 
 	/**
-	 * Constructor for McpPrompt.
+	 * Create a prompt definition from an array configuration.
 	 *
-	 * @param string      $ability The ability name.
-	 * @param string      $name Unique identifier for the prompt.
-	 * @param string|null $title Optional human-readable name for display.
-	 * @param string|null $description Optional human-readable description.
-	 * @param array       $arguments Optional list of arguments for customization.
-	 * @param array       $annotations Optional properties describing prompt metadata.
+	 * @param array $config The prompt configuration array.
+	 *
+	 * @return self|\WP_Error
 	 */
-	public function __construct(
-		string $ability,
-		string $name,
-		?string $title = null,
-		?string $description = null,
-		array $arguments = array(),
-		array $annotations = array()
-	) {
-		$this->ability     = $ability;
-		$this->name        = $name;
-		$this->title       = $title;
-		$this->description = $description;
-		$this->arguments   = $arguments;
-		$this->annotations = $annotations;
+	public static function fromArray( array $config ) {
+		if ( empty( $config['name'] ) ) {
+			return new WP_Error( 'mcp_prompt_missing_name', 'Prompt configuration must include a "name" field.' );
+		}
+
+		if ( ! isset( $config['handler'] ) || ! is_callable( $config['handler'] ) ) {
+			return new WP_Error( 'mcp_prompt_missing_handler', 'Prompt configuration must include a callable "handler" field.' );
+		}
+
+		$prompt_data = array( 'name' => $config['name'] );
+		if ( isset( $config['description'] ) ) {
+			$prompt_data['description'] = $config['description'];
+		}
+
+		if ( isset( $config['title'] ) ) {
+			$prompt_data['title'] = $config['title'];
+		}
+
+		// Icons and _meta are carried as given; the schema decides whether they fit.
+		if ( isset( $config['meta'] ) ) {
+			$prompt_data['_meta'] = $config['meta'];
+		}
+
+		if ( isset( $config['icons'] ) ) {
+			$prompt_data['icons'] = $config['icons'];
+		}
+
+		// Arguments are carried as given; a list is re-indexed so it serializes as a
+		// JSON array. The schema decides whether the entries fit.
+		if ( isset( $config['arguments'] ) ) {
+			$prompt_data['arguments'] = is_array( $config['arguments'] )
+				? array_values( $config['arguments'] )
+				: $config['arguments'];
+		}
+
+		$instance          = new self( $prompt_data );
+		$instance->handler = $config['handler'];
+
+		if ( isset( $config['permission'] ) && is_callable( $config['permission'] ) ) {
+			$instance->permission_callback = $config['permission'];
+		}
+
+		$instance->observability_context = array(
+			'component_type' => 'prompt',
+			'prompt_name'    => $config['name'],
+			'source'         => 'array',
+		);
+
+		return $instance;
 	}
 
 	/**
-	 * Get the prompt name.
+	 * Create an ability-backed MCP prompt.
 	 *
-	 * @return string
+	 * @param \WP_Ability $ability WordPress ability.
+	 *
+	 * @return self|\WP_Error
+	 */
+	public static function fromAbility( \WP_Ability $ability ) {
+		$prompt_data = RegisterAbilityAsMcpPrompt::build( $ability );
+		if ( $prompt_data instanceof WP_Error ) {
+			return $prompt_data;
+		}
+
+		$instance               = new self( $prompt_data['prompt_data'] );
+		$instance->adapter_meta = $prompt_data['adapter_meta'];
+		$instance->ability      = $ability;
+
+		$instance->observability_context = array(
+			'component_type' => 'prompt',
+			'prompt_name'    => $prompt_data['prompt_data']['name'],
+			'ability_name'   => $ability->get_name(),
+			'source'         => 'ability',
+		);
+
+		return $instance;
+	}
+
+	/**
+	 * Create a builder-backed MCP prompt.
+	 *
+	 * @param \WP\MCP\Domain\Prompts\Contracts\McpPromptBuilderInterface $builder Builder instance.
+	 *
+	 * @return self|\WP_Error
+	 */
+	public static function fromBuilder( McpPromptBuilderInterface $builder ) {
+		$prompt = self::guard( 'mcp_prompt_builder_failed', static fn() => $builder->build() );
+		if ( $prompt instanceof WP_Error ) {
+			return $prompt;
+		}
+
+		$instance          = new self( $prompt );
+		$instance->builder = $builder;
+
+		$instance->adapter_meta = array(
+			'source'        => 'builder',
+			'builder_class' => get_class( $builder ),
+		);
+
+		$instance->observability_context = array(
+			'component_type' => 'prompt',
+			'prompt_name'    => (string) ( $prompt['name'] ?? '' ),
+			'source'         => 'builder',
+		);
+
+		return $instance;
+	}
+
+	// =========================================================================
+	// McpComponentInterface Implementation
+	// =========================================================================
+
+	/**
+	 * Get the clean protocol record for one revision.
+	 *
+	 * @param \WP\McpSchema\Schema $schema Selected schema.
+	 * @since 0.7.0
+	 */
+	public function get_protocol_record( Schema $schema ): Prompt {
+		return $this->project_record( $schema, Prompt::class, $this->protocol_data() );
+	}
+
+	/**
+	 * Get the neutral prompt name.
+	 *
+	 * @since 0.7.0
 	 */
 	public function get_name(): string {
-		return $this->name;
+		return (string) ( $this->protocol_data()['name'] ?? '' );
 	}
 
 	/**
-	 * Get the prompt title.
+	 * Execute the prompt.
 	 *
-	 * @return string|null
+	 * @param mixed $arguments Prompt arguments.
+	 *
+	 * @return mixed
 	 */
-	public function get_title(): ?string {
-		return $this->title;
-	}
+	public function execute( $arguments ) {
+		$args = $this->unwrap_input_if_needed( $arguments );
+		$args = is_array( $args ) ? $args : array();
 
-	/**
-	 * Get the prompt description.
-	 *
-	 * @return string|null
-	 */
-	public function get_description(): ?string {
-		return $this->description;
-	}
-
-	/**
-	 * Get the prompt arguments.
-	 *
-	 * @return array
-	 */
-	public function get_arguments(): array {
-		return $this->arguments;
-	}
-
-	/**
-	 * Get the annotations.
-	 *
-	 * @return array
-	 */
-	public function get_annotations(): array {
-		return $this->annotations;
-	}
-
-	/**
-	 * Get the ability name.
-	 *
-	 * @return \WP_Ability|\WP_Error WP_Ability instance on success, WP_Error on failure.
-	 */
-	public function get_ability() {
-		$ability = wp_get_ability( $this->ability );
-		if ( ! $ability ) {
-			return new \WP_Error(
-				'ability_not_found',
-				sprintf(
-					/* translators: %s: ability name */
-					esc_html__( "WordPress ability '%s' does not exist.", 'mcp-adapter' ),
-					esc_html( $this->ability )
-				)
-			);
+		if ( null !== $this->ability ) {
+			$ability = $this->ability;
+			$args    = AbilityArgumentNormalizer::normalize( $ability, $args );
+			$result  = self::guard( 'mcp_execution_failed', static fn() => $ability->execute( $args ) );
+		} elseif ( null !== $this->builder ) {
+			$builder = $this->builder;
+			$result  = self::guard( 'mcp_execution_failed', static fn() => $builder->handle( $args ) );
+		} elseif ( null !== $this->handler ) {
+			$handler = $this->handler;
+			$result  = self::guard( 'mcp_execution_failed', static fn() => call_user_func( $handler, $args ) );
+		} else {
+			return new WP_Error( 'mcp_prompt_no_handler', 'No prompt execution strategy configured.' );
 		}
-		return $ability;
+
+		if ( $result instanceof WP_Error ) {
+			return $result;
+		}
+
+		if ( ! is_array( $result ) ) {
+			$result = array( 'result' => $result );
+		}
+
+		return $result;
 	}
 
 	/**
-	 * Set the prompt title.
+	 * Unwrap prompt input arguments when the input schema was transformed (flattened → object wrapper).
 	 *
-	 * @param string|null $title The title to set.
+	 * @param mixed $arguments Raw prompt arguments.
 	 *
-	 * @return void
+	 * @return mixed
 	 */
-	public function set_title( ?string $title ): void {
-		$this->title = $title;
+	private function unwrap_input_if_needed( $arguments ) {
+		$is_transformed = true === ( $this->adapter_meta['input_schema_transformed'] ?? false );
+
+		if ( ! $is_transformed ) {
+			return $arguments;
+		}
+
+		$wrapper = $this->adapter_meta['input_schema_wrapper'] ?? 'input';
+		$wrapper = is_string( $wrapper ) && '' !== trim( $wrapper ) ? $wrapper : 'input';
+
+		return is_array( $arguments ) ? ( $arguments[ $wrapper ] ?? null ) : null;
 	}
 
 	/**
-	 * Set the prompt description.
+	 * Check whether the current request has permission to execute this prompt.
 	 *
-	 * @param string|null $description The description to set.
+	 * @param mixed $arguments Prompt arguments.
 	 *
-	 * @return void
+	 * @return bool|\WP_Error
 	 */
-	public function set_description( ?string $description ): void {
-		$this->description = $description;
-	}
+	public function check_permission( $arguments ) {
+		$args = $this->unwrap_input_if_needed( $arguments );
+		$args = is_array( $args ) ? $args : array();
 
-	/**
-	 * Set the prompt arguments.
-	 *
-	 * @param array $arguments The arguments to set.
-	 *
-	 * @return void
-	 */
-	public function set_arguments( array $arguments ): void {
-		$this->arguments = $arguments;
-	}
+		if ( null !== $this->ability ) {
+			$ability = $this->ability;
+			$args    = AbilityArgumentNormalizer::normalize( $ability, $args );
 
-	/**
-	 * Set the annotations.
-	 *
-	 * @param array $annotations The annotations to set.
-	 *
-	 * @return void
-	 */
-	public function set_annotations( array $annotations ): void {
-		$this->annotations = $annotations;
-	}
+			return self::guard( 'mcp_permission_check_failed', static fn() => $ability->check_permissions( $args ) );
+		}
 
-	/**
-	 * Add an argument to the prompt.
-	 *
-	 * @param array $argument The argument to add.
-	 *
-	 * @return void
-	 */
-	public function add_argument( array $argument ): void {
-		$this->arguments[] = $argument;
-	}
+		if ( null !== $this->builder ) {
+			$builder = $this->builder;
 
-	/**
-	 * Remove an argument by name.
-	 *
-	 * @param string $name The argument name to remove.
-	 *
-	 * @return void
-	 */
-	public function remove_argument( string $name ): void {
-		$this->arguments = array_filter(
-			$this->arguments,
-			static function ( $argument ) use ( $name ) {
-				return ( $argument['name'] ?? '' ) !== $name;
-			}
+			return self::guard( 'mcp_permission_check_failed', static fn() => $builder->has_permission( $args ) );
+		}
+
+		if ( null !== $this->permission_callback ) {
+			$callback = $this->permission_callback;
+			$result   = self::guard( 'mcp_permission_check_failed', static fn() => call_user_func( $callback, $args ) );
+
+			return $result instanceof WP_Error ? $result : (bool) $result;
+		}
+
+		return new WP_Error(
+			'mcp_permission_denied',
+			'Access denied.',
+			array( 'failure_reason' => FailureReason::NO_PERMISSION_STRATEGY )
 		);
-		// Re-index array.
-		$this->arguments = array_values( $this->arguments );
 	}
 
 	/**
-	 * Get an argument by name.
+	 * Get internal adapter metadata for this prompt.
 	 *
-	 * @param string $name The argument name.
-	 *
-	 * @return array|null The argument if found, null otherwise.
+	 * @return array<string, mixed>
 	 */
-	public function get_argument( string $name ): ?array {
-		foreach ( $this->arguments as $argument ) {
-			if ( ( $argument['name'] ?? '' ) === $name ) {
-				return $argument;
-			}
-		}
-
-		return null;
+	public function get_adapter_meta(): array {
+		return $this->adapter_meta;
 	}
 
 	/**
-	 * Check if an argument exists.
+	 * Get observability context tags for logging/metrics.
 	 *
-	 * @param string $name The argument name.
-	 *
-	 * @return bool True if argument exists, false otherwise.
+	 * @return array<string, mixed>
 	 */
-	public function has_argument( string $name ): bool {
-		return $this->get_argument( $name ) !== null;
+	public function get_observability_context(): array {
+		return $this->observability_context;
 	}
 
-	/**
-	 * Add an annotation.
-	 *
-	 * @param string $key The annotation key.
-	 * @param mixed  $value The annotation value.
-	 *
-	 * @return void
-	 */
-	public function add_annotation( string $key, $value ): void {
-		$this->annotations[ $key ] = $value;
-	}
+	// =========================================================================
+	// Private Helper Methods
+	// =========================================================================
 
 	/**
-	 * Remove an annotation.
+	 * Get the underlying builder instance, when builder-backed.
 	 *
-	 * @param string $key The annotation key to remove.
-	 *
-	 * @return void
+	 * @return \WP\MCP\Domain\Prompts\Contracts\McpPromptBuilderInterface|null
 	 */
-	public function remove_annotation( string $key ): void {
-		unset( $this->annotations[ $key ] );
-	}
-
-	/**
-	 * Convert the prompt to an array representation according to MCP specification.
-	 *
-	 * @return array
-	 */
-	public function to_array(): array {
-		$prompt_data = array(
-			'name' => $this->name,
-		);
-
-		// Add optional fields only if they have values.
-		if ( ! is_null( $this->title ) ) {
-			$prompt_data['title'] = $this->title;
-		}
-
-		if ( ! is_null( $this->description ) ) {
-			$prompt_data['description'] = $this->description;
-		}
-
-		if ( ! empty( $this->arguments ) ) {
-			$prompt_data['arguments'] = $this->arguments;
-		}
-
-		if ( ! empty( $this->annotations ) ) {
-			$prompt_data['annotations'] = $this->annotations;
-		}
-
-		return $prompt_data;
-	}
-
-	/**
-	 * Convert the prompt to JSON representation.
-	 *
-	 * @return string
-	 */
-	public function to_json(): string {
-		$json = wp_json_encode( $this->to_array() );
-		return false !== $json ? $json : '{}';
-	}
-
-	/**
-	 * Create an McpPrompt instance from an array.
-	 *
-	 * @param array     $data Array containing prompt data.
-	 * @param \WP\MCP\Core\McpServer $mcp_server The MCP server instance.
-	 *
-	 * @return self|\WP_Error Returns a new McpPrompt instance or WP_Error if validation fails.
-	 */
-	public static function from_array( array $data, McpServer $mcp_server ) {
-		$prompt = new self(
-			$data['ability'] ?? '',
-			$data['name'] ?? '',
-			$data['title'] ?? null,
-			$data['description'] ?? null,
-			$data['arguments'] ?? array(),
-			$data['annotations'] ?? array()
-		);
-
-		$prompt->set_mcp_server( $mcp_server );
-
-		return $prompt->validate( "McpPrompt::from_array::{$data['name']}" );
-	}
-
-	/**
-	 * Validate the prompt instance.
-	 *
-	 * @param string $context Optional context for error messages.
-	 *
-	 * @return self|\WP_Error Returns the validated prompt instance or WP_Error if validation fails.
-	 */
-	public function validate( string $context = '' ) {
-		if ( null === $this->mcp_server ) {
-			return new \WP_Error(
-				'prompt_missing_mcp_server',
-				esc_html__( 'MCP server must be set before validating a prompt.', 'mcp-adapter' )
-			);
-		}
-
-		if ( ! $this->mcp_server->is_mcp_validation_enabled() ) {
-			return $this;
-		}
-
-		$context_to_use    = $context ?: "McpPrompt::{$this->name}";
-		$validation_result = McpPromptValidator::validate_prompt_instance( $this, $context_to_use );
-
-		if ( is_wp_error( $validation_result ) ) {
-			return $validation_result;
-		}
-
-		return $this;
-	}
-
-	/**
-	 * Create a standard argument definition.
-	 *
-	 * @param string      $name The argument name.
-	 * @param string|null $description Optional argument description.
-	 * @param bool        $required Whether the argument is required.
-	 *
-	 * @return array The argument definition.
-	 */
-	public static function create_argument( string $name, ?string $description = null, bool $required = false ): array {
-		$argument = array(
-			'name' => $name,
-		);
-
-		if ( ! is_null( $description ) ) {
-			$argument['description'] = $description;
-		}
-
-		if ( $required ) {
-			$argument['required'] = true;
-		}
-
-		return $argument;
-	}
-
-	/**
-	 * Get the MCP server instance this tool belongs to.
-	 *
-	 * @return \WP\MCP\Core\McpServer
-	 */
-	public function get_mcp_server(): McpServer {
-		if ( null === $this->mcp_server ) {
-			throw new \RuntimeException( 'MCP server has not been set on this prompt instance.' );
-		}
-
-		return $this->mcp_server;
-	}
-
-	/**
-	 * Set the MCP server instance this tool belongs to.
-	 *
-	 * @param \WP\MCP\Core\McpServer $mcp_server The MCP server instance.
-	 *
-	 * @return void
-	 */
-	public function set_mcp_server( McpServer $mcp_server ): void {
-		$this->mcp_server = $mcp_server;
-	}
-
-	/**
-	 * Check if this prompt is builder-based (has direct execution capability).
-	 *
-	 * @return bool True if this prompt can execute directly, false if it needs abilities.
-	 */
-	public function is_builder_based(): bool {
-		return false; // Default: requires abilities
-	}
-
-	/**
-	 * Execute the prompt directly (for builder-based prompts).
-	 *
-	 * @param array $arguments The arguments passed to the prompt.
-	 *
-	 * @return array The prompt response.
-	 * @throws \Exception If this prompt is not builder-based.
-	 */
-	public function execute_direct( array $arguments ): array {
-		throw new \Exception( 'This prompt does not support direct execution' );
-	}
-
-	/**
-	 * Check permission directly (for builder-based prompts).
-	 *
-	 * @param array $arguments The arguments passed to the prompt.
-	 *
-	 * @return bool True if execution is allowed.
-	 * @throws \Exception If this prompt is not builder-based.
-	 */
-	public function check_permission_direct( array $arguments ): bool {
-		throw new \Exception( 'This prompt does not support direct permission checking' );
+	public function get_builder(): ?McpPromptBuilderInterface {
+		return $this->builder;
 	}
 }

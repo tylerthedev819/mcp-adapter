@@ -4,15 +4,6 @@ Common issues and quick solutions for the MCP Adapter.
 
 ## Quick Fixes
 
-### MCP Adapter Not Found
-```bash
-# Check plugin is active
-wp plugin status mcp-adapter
-
-# If using Composer, verify Jetpack autoloader
-ls vendor/autoload_packages.php
-```
-
 ### REST API 404 Errors
 ```bash
 # Check WordPress REST API works
@@ -31,6 +22,45 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | wp mcp-adapter serve --u
 wp user list --fields=ID,user_login,roles
 ```
 
+### HTTP session errors (missing or invalid Mcp-Session-Id)
+
+When using the HTTP REST API, all requests after `initialize` must include the `Mcp-Session-Id` header. Omitting it or sending an invalid value are the most common causes of unexpected errors.
+
+**Symptom: JSON-RPC error `-32600` — "Missing Mcp-Session-Id header"**
+
+The request is missing the `Mcp-Session-Id` header. Every request except `initialize` must include it.
+
+```bash
+# Wrong — no session header
+curl -s -X POST "https://yoursite.com/wp-json/mcp/mcp-adapter-default-server" \
+  --user "username:application_password" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+
+# Correct — include the session header received from initialize
+curl -s -X POST "https://yoursite.com/wp-json/mcp/mcp-adapter-default-server" \
+  --user "username:application_password" \
+  -H "Content-Type: application/json" \
+  -H "Mcp-Session-Id: <session-id-from-initialize>" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+```
+
+**Symptom: "Invalid or expired session" in JSON-RPC error response**
+
+The session ID is not recognized or has exceeded the inactivity timeout. Re-initialize to obtain a new session:
+
+```bash
+# Re-initialize to get a fresh session
+curl -s -D - -X POST "https://yoursite.com/wp-json/mcp/mcp-adapter-default-server" \
+  --user "username:application_password" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"my-client","version":"1.0.0"}}}'
+```
+
+**Tip:** The default inactivity timeout is 24 hours (`DAY_IN_SECONDS`). If your client is long-lived, keep the session active by sending requests periodically. You can also adjust the timeout with the `mcp_adapter_session_inactivity_timeout` filter.
+
+**Note:** STDIO transport (WP-CLI) does not use HTTP sessions. If you see session errors, verify you are using the correct transport for your use case. See the [HTTP Sessions section](../guides/default-server.md#http-sessions) for the full session flow.
+
 ## Installation Issues
 
 ### Plugin Not Active
@@ -42,49 +72,30 @@ wp plugin activate mcp-adapter
 wp plugin status mcp-adapter
 ```
 
-### Composer Dependencies Missing
+### Composer Autoloader Missing
+
+If you see *"The Composer autoloader was not found"*, the plugin's dependencies have not been installed. The release zip ships with its `vendor/` directory, so this only happens when the plugin was installed from a source checkout.
+
 ```bash
-# Install dependencies including Jetpack Autoloader
+# Install dependencies in the plugin directory
 cd wp-content/plugins/mcp-adapter
-composer require automattic/jetpack-autoloader
 composer install
 
-# Check Jetpack autoloader exists
+# Check the autoloader exists (Jetpack Autoloader, not autoload.php)
 ls vendor/autoload_packages.php
 ```
 
-### Why Use Jetpack Autoloader?
+Alternatively, install a release build instead of a source checkout:
 
-**Problem**: Multiple plugins using different versions of MCP Adapter can cause conflicts:
+```bash
+wp plugin install https://github.com/WordPress/mcp-adapter/releases/latest/download/mcp-adapter.zip --activate --force
 ```
-Plugin A uses MCP Adapter v1.0 → loads first
-Plugin B uses MCP Adapter v1.2 → can't load, causes errors
-```
-
-**Solution**: Jetpack Autoloader automatically loads the **latest version**:
-```
-Plugin A uses MCP Adapter v1.0 + Jetpack Autoloader
-Plugin B uses MCP Adapter v1.2 + Jetpack Autoloader
-→ Both plugins use v1.2 (latest), no conflicts
-```
-
-**Benefits**:
-- ✅ **Prevents version conflicts** between plugins
-- ✅ **Automatic latest version** loading
-- ✅ **WordPress optimized** for plugin environments
-- ✅ **Zero configuration** needed
 
 ### Class Not Found
-```php
-// For Composer projects, check Jetpack autoloader
-if ( ! class_exists( 'WP\MCP\Core\McpAdapter' ) ) {
-    // Load Jetpack autoloader
-    if ( is_file( __DIR__ . '/vendor/autoload_packages.php' ) ) {
-        require_once __DIR__ . '/vendor/autoload_packages.php';
-    }
-}
 
-// For plugin usage, check plugin is active
+`WP\MCP\*` classes are provided by the MCP Adapter plugin. If they are missing, the plugin is not active. Check for it rather than trying to load an autoloader yourself:
+
+```php
 if ( ! class_exists( 'WP\MCP\Core\McpAdapter' ) ) {
     add_action( 'admin_notices', function() {
         echo '<div class="notice notice-error"><p>MCP Adapter plugin must be active.</p></div>';
@@ -93,12 +104,14 @@ if ( ! class_exists( 'WP\MCP\Core\McpAdapter' ) ) {
 }
 ```
 
+Add `Requires Plugins: mcp-adapter` to your plugin header so WordPress loads MCP Adapter before your plugin.
+
 ### Abilities API Missing
 ```php
 // Check in your plugin
 if ( ! function_exists( 'wp_register_ability' ) ) {
     add_action( 'admin_notices', function() {
-        echo '<div class="notice notice-error"><p>WordPress Abilities API is required.</p></div>';
+        echo '<div class="notice notice-error"><p>MCP Adapter requires WordPress 6.9 or newer. The Abilities API is included in core.</p></div>';
     });
     return;
 }
@@ -205,6 +218,40 @@ function(): bool {
 ```
 
 ## Ability Issues
+
+### `wp_register_ability()` returns `null`
+
+A common cause is a missing or unregistered `category`. `wp_register_ability()` requires a `category`, and that category must already be registered when registration runs. If it is missing or unknown, the function returns `null` and the ability never appears. There is no `WP_Error`; core calls `_doing_it_wrong()`, which only surfaces a notice when `WP_DEBUG` is on. With `WP_DEBUG` off (typical on production) it looks completely silent. Enable `WP_DEBUG` to surface the notice, plus `WP_DEBUG_LOG` to capture it in `wp-content/debug.log`, then look for a message like `Ability category "..." is not registered`.
+
+```php
+// Wrong: no category → returns null, ability never registers.
+wp_register_ability( 'my-plugin/my-ability', [
+    'label'       => 'My Ability',
+    'description' => 'Test ability',
+    // ...
+] );
+
+// Right: use a registered category. Core provides 'site' and 'user'.
+wp_register_ability( 'my-plugin/my-ability', [
+    'label'       => 'My Ability',
+    'description' => 'Test ability',
+    'category'    => 'site',
+    // ...
+] );
+```
+
+For a custom category, register it first on the `wp_abilities_api_categories_init` hook (a separate, earlier hook than `wp_abilities_api_init`):
+
+```php
+add_action( 'wp_abilities_api_categories_init', function () {
+    wp_register_ability_category( 'my-plugin', [
+        'label'       => 'My Plugin',
+        'description' => 'Abilities provided by My Plugin.',
+    ] );
+} );
+```
+
+See [Ability categories](../guides/creating-abilities.md#ability-categories-required) for details.
 
 ### Ability Not Found
 ```bash
@@ -317,7 +364,8 @@ class MyErrorHandler implements \WP\MCP\Infrastructure\ErrorHandling\Contracts\M
 // Check implementation
 if ( ! in_array( 
     \WP\MCP\Infrastructure\ErrorHandling\Contracts\McpErrorHandlerInterface::class, 
-    class_implements( MyErrorHandler::class ) 
+    class_implements( MyErrorHandler::class ),
+    true
 )) {
     error_log( 'Error handler missing interface' );
 }
@@ -329,9 +377,7 @@ if ( ! in_array(
 use WP\MCP\Infrastructure\ErrorHandling\McpErrorFactory;
 
 if ( empty( $params['name'] ) ) {
-    return [
-        'error' => McpErrorFactory::missing_parameter( $request_id, 'name' )['error']
-    ];
+    return McpErrorFactory::missing_parameter( $request_id, 'name' );
 }
 ```
 

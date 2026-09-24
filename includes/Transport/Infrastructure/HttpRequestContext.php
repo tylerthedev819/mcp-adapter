@@ -1,6 +1,6 @@
 <?php
 /**
- * MCP HTTP Transport for WordPress - MCP 2025-06-18 Compliant
+ * Exact-revision MCP HTTP request context for WordPress.
  *
  * @package McpAdapter
  */
@@ -37,11 +37,27 @@ class HttpRequestContext {
 	public ?string $session_id;
 
 	/**
-	 * The JSON-decoded body of the request.
+	 * The undecoded request body.
 	 *
-	 * @var array|null
+	 * @var string
 	 */
-	public ?array $body;
+	public string $raw_body;
+
+	/**
+	 * Normalized MCP header names mapped to their first string value.
+	 *
+	 * @var array<string, string>
+	 */
+	public array $headers;
+
+	/**
+	 * The MCP-Protocol-Version header from the request.
+	 *
+	 * @since 0.5.0
+	 *
+	 * @var string|null
+	 */
+	public ?string $protocol_version;
 
 	/**
 	 * The Accept header from the request.
@@ -56,10 +72,42 @@ class HttpRequestContext {
 	 * @param \WP_REST_Request<array<string, mixed>> $request The original request object.
 	 */
 	public function __construct( \WP_REST_Request $request ) {
-		$this->request       = $request;
-		$this->method        = $request->get_method();
-		$this->session_id    = $request->get_header( 'Mcp-Session-Id' );
-		$this->accept_header = $request->get_header( 'accept' );
-		$this->body          = 'POST' === $this->method ? $request->get_json_params() : null;
+		$this->request          = $request;
+		$this->method           = $request->get_method();
+		$this->session_id       = $request->get_header( 'Mcp-Session-Id' );
+		$this->protocol_version = $request->get_header( 'Mcp-Protocol-Version' );
+		$this->accept_header    = $request->get_header( 'accept' );
+		$this->raw_body         = 'POST' === $this->method ? ( $request->get_body() ?? '' ) : '';
+		$this->headers          = $this->prepare_headers( $request->get_headers() );
+	}
+
+	/**
+	 * Select MCP headers and normalize their names and values.
+	 *
+	 * @since 0.7.0
+	 *
+	 * @param array<string, mixed> $headers Headers supplied by the REST request.
+	 * @return array<string, string> Normalized MCP headers retaining the first value only when it is a string.
+	 */
+	private function prepare_headers( array $headers ): array {
+		$prepared = array();
+		foreach ( $headers as $name => $values ) {
+			$key = str_replace( '_', '-', strtolower( (string) $name ) );
+			if (
+				! in_array( $key, array( 'mcp-protocol-version', 'mcp-method', 'mcp-name', 'mcp-session-id' ), true )
+				&& 0 !== strpos( $key, 'mcp-param-' )
+			) {
+				continue;
+			}
+
+			$value = is_array( $values ) ? reset( $values ) : $values;
+			if ( ! is_string( $value ) ) {
+				continue;
+			}
+
+			$prepared[ $key ] = $value;
+		}
+
+		return $prepared;
 	}
 }

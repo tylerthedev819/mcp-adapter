@@ -10,12 +10,9 @@ Join the `#core-ai` channel [on WordPress Slack](http://wordpress.slack.com) ([s
 
 ## Coding standards
 
-In general, all code must follow the [WordPress Coding Standards and best practices](https://developer.wordpress.org/coding-standards/). All code in the Performance Lab plugin must follow these requirements:
+In general, all code must follow the [WordPress Coding Standards and best practices](https://developer.wordpress.org/coding-standards/).
 
-- **WordPress**: As of MCP Adapter v0.1.0, released {@todo}, the plugin's minimum WordPress version requirement is 6.8.
-- **PHP**: The minimum required version right now is 7.4. This is subject to change and will be brought in sync with the WordPress core minimum PHP version requirement closer to release.
-
-We include [several tools](#useful-commands) to help ensure your code meets contribution
+We include [several tools](#useful-commands) to help ensure your code meets these standards.
 
 ## Guidelines
 
@@ -25,13 +22,13 @@ We include [several tools](#useful-commands) to help ensure your code meets cont
 
 ## Reporting Security Issues
 
-Please see [SECURITY.md] (@TODO).
+Please see [SECURITY.md](SECURITY.md).
 
 ## Local Setup
 
 ### Prerequisites
 
-- Node.js: 20.x (NVM recommended)
+- Node.js: 22.x (NVM recommended)
 - Docker
 - Git
 - Composer: (if you prefer to run the Composer tools locally)
@@ -77,7 +74,7 @@ The WordPress development site will be available at http://localhost:8888 and th
 
 - `npm run wp-env start`: Start the local development environment.
 - `npm run wp-env stop`: Stop the local development environment.
-- `npm run wp-env run tests-cli YOUR_CMD_HERE`: Run WP-CLI commands in the local environment.
+- `npm run wp-env:cli -- YOUR_CMD_HERE`: Run WP-CLI commands in the local environment.
 
 For more information on using `wp-env`, see the [wp-env documentation](https://developer.wordpress.org/block-editor/packages/packages-env/).
 

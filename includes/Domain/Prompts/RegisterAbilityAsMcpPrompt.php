@@ -1,15 +1,20 @@
 <?php
+
 /**
  * RegisterAbilityAsMcpPrompt class for converting WordPress abilities to MCP prompts.
  *
  * @package McpAdapter
  */
 
+declare( strict_types=1 );
+
 namespace WP\MCP\Domain\Prompts;
 
-use WP\MCP\Core\McpServer;
-use WP\MCP\Domain\Utils\McpAnnotationMapper;
-use WP_Ability;
+use WP\MCP\Domain\Utils\McpAbilityMeta;
+use WP\MCP\Domain\Utils\McpNameSanitizer;
+use WP\MCP\Domain\Utils\McpValidator;
+use WP\MCP\Domain\Utils\SchemaTransformer;
+use WP_Error;
 
 /**
  * Converts WordPress abilities to MCP prompts according to the specification.
@@ -17,8 +22,11 @@ use WP_Ability;
  * This class extracts prompt data from ability properties and converts the JSON Schema
  * input_schema to MCP prompt arguments format.
  *
- * The ability must have an input_schema defined using JSON Schema format, which will
- * be automatically converted to MCP prompt arguments.
+ * Schema Handling:
+ * - Object schemas with properties: Each property becomes a PromptArgument
+ * - Flattened schemas (type: string, number, etc.): Wrapped as single argument named "input"
+ * - Empty/null schemas: No arguments
+ * - Complex schemas (oneOf/anyOf) without properties: No arguments (documented limitation)
  *
  * Example ability registration:
  * wp_register_ability(
@@ -39,89 +47,170 @@ use WP_Ability;
  *         )
  *     )
  * );
+ *
+ * @internal
+ *
+ * @since 0.5.0
  */
 class RegisterAbilityAsMcpPrompt {
+
 	/**
 	 * The WordPress ability instance.
 	 *
 	 * @var \WP_Ability
 	 */
-	private WP_Ability $ability;
-
-	/**
-	 * The MCP server.
-	 *
-	 * @var \WP\MCP\Core\McpServer
-	 */
-	private McpServer $mcp_server;
-
-	/**
-	 * Make a new instance of the class.
-	 *
-	 * @param \WP_Ability            $ability    The ability.
-	 * @param \WP\MCP\Core\McpServer $mcp_server The MCP server.
-	 *
-	 * @return \WP\MCP\Domain\Prompts\McpPrompt|\WP_Error Returns prompt instance or WP_Error if validation fails.
-	 */
-	public static function make( WP_Ability $ability, McpServer $mcp_server ) {
-		$prompt = new self( $ability, $mcp_server );
-
-		return $prompt->get_prompt();
-	}
+	private \WP_Ability $ability;
 
 	/**
 	 * Constructor.
 	 *
-	 * @param \WP_Ability            $ability    The ability.
-	 * @param \WP\MCP\Core\McpServer $mcp_server The MCP server.
+	 * @param \WP_Ability $ability The ability.
 	 */
-	private function __construct( WP_Ability $ability, McpServer $mcp_server ) {
-		$this->mcp_server = $mcp_server;
-		$this->ability    = $ability;
+	private function __construct( \WP_Ability $ability ) {
+		$this->ability = $ability;
 	}
 
 	/**
-	 * Get the MCP prompt data array.
+	 * Build neutral Prompt data and adapter metadata for internal wiring.
 	 *
-	 * @return array<string,mixed>
+	 * This method returns protocol-only data and provides the adapter metadata
+	 * separately. Exact validation happens independently for every schema projection.
+	 *
+	 * @param \WP_Ability $ability The ability.
+	 *
+	 * @return array{prompt_data: array<string, mixed>, adapter_meta: array<string, mixed>}|\WP_Error
+	 * @since 0.5.0
 	 */
-	private function get_data(): array {
-		$ability_name = trim( $this->ability->get_name() );
-		$prompt_data  = array(
-			'ability' => $ability_name,
-			'name'    => str_replace( '/', '-', $ability_name ),
+	public static function build( \WP_Ability $ability ) {
+		$prompt = new self( $ability );
+
+		return $prompt->build_prompt_data();
+	}
+
+	/**
+	 * Build prompt data and adapter metadata.
+	 *
+	 * Per MCP 2025-11-25 specification, Prompt objects do NOT support annotations at the
+	 * template level. Annotations are only supported on content blocks inside prompt messages
+	 * (messages[].content.annotations).
+	 *
+	 * Arguments Resolution:
+	 * 1. If `ability.meta.mcp.arguments` is defined and non-empty, use it as given (explicit override)
+	 * 2. Otherwise, auto-convert from `ability.input_schema`
+	 *
+	 * This follows the `mcp.*` override pattern used elsewhere (mcp.uri, mcp.icons, mcp.annotations).
+	 * Explicit arguments are not inspected; the schema decides whether each entry fits.
+	 *
+	 * @return array{prompt_data: array<string, mixed>, adapter_meta: array<string, mixed>}|\WP_Error Prompt data and adapter metadata, or WP_Error if `meta.mcp` or `mcp.arguments` is not an array.
+	 * @since 0.5.0
+	 */
+	private function build_prompt_data() {
+		$prompt_name = $this->resolve_prompt_name();
+		if ( is_wp_error( $prompt_name ) ) {
+			return $prompt_name;
+		}
+
+		$mcp_meta = McpAbilityMeta::mcp( $this->ability );
+		if ( is_wp_error( $mcp_meta ) ) {
+			return $mcp_meta;
+		}
+
+		// Label and description are carried as given; core requires both to be
+		// non-empty strings, so nothing is trimmed or suppressed here.
+		$prompt_data = array(
+			'name'        => $prompt_name,
+			'title'       => $this->ability->get_label(),
+			'description' => $this->ability->get_description(),
 		);
 
-		// Add optional title from ability label
-		$label = trim( $this->ability->get_label() );
-		if ( ! empty( $label ) ) {
-			$prompt_data['title'] = $label;
+		// Check for explicit mcp.arguments override first; otherwise auto-convert
+		// from input_schema. Track where the arguments came from and whether a
+		// flattened schema was wrapped, for the adapter metadata below.
+		$arguments_source = null;
+		$transform        = null;
+
+		$explicit_arguments = $this->get_explicit_arguments( $mcp_meta );
+		if ( is_wp_error( $explicit_arguments ) ) {
+			return $explicit_arguments;
 		}
 
-		// Add optional description
-		$description = trim( $this->ability->get_description() );
-		if ( ! empty( $description ) ) {
-			$prompt_data['description'] = $description;
-		}
-
-		$input_schema = $this->ability->get_input_schema();
-		if ( ! empty( $input_schema ) ) {
-			$arguments = $this->convert_input_schema_to_arguments( $input_schema );
-			if ( ! empty( $arguments ) ) {
-				$prompt_data['arguments'] = $arguments;
+		if ( ! empty( $explicit_arguments ) ) {
+			$prompt_data['arguments'] = $explicit_arguments;
+			$arguments_source         = 'explicit';
+		} else {
+			$input_schema = $this->ability->get_input_schema();
+			if ( ! empty( $input_schema ) ) {
+				// Use SchemaTransformer to handle flattened schemas (consistent with tool behavior).
+				$transform = SchemaTransformer::transform_to_object_schema( $input_schema );
+				$arguments = $this->convert_input_schema_to_arguments( $transform['schema'] );
+				if ( ! empty( $arguments ) ) {
+					$prompt_data['arguments'] = $arguments;
+					$arguments_source         = 'schema';
+				}
 			}
 		}
 
-		// Map annotations from ability meta to MCP format using unified mapper.
-		$ability_meta = $this->ability->get_meta();
-		if ( ! empty( $ability_meta['annotations'] ) && is_array( $ability_meta['annotations'] ) ) {
-			$mcp_annotations = McpAnnotationMapper::map( $ability_meta['annotations'], 'prompt' );
-			if ( ! empty( $mcp_annotations ) ) {
-				$prompt_data['annotations'] = $mcp_annotations;
-			}
+		// Icons from ability.meta.mcp.icons are carried as given; the schema decides
+		// whether they fit.
+		if ( isset( $mcp_meta['icons'] ) ) {
+			$prompt_data['icons'] = $mcp_meta['icons'];
 		}
 
-		return $prompt_data;
+		// Adapter metadata is never included in protocol data.
+		$adapter_meta = array(
+			'ability' => $this->ability->get_name(),
+		);
+
+		if ( null !== $arguments_source ) {
+			$adapter_meta['arguments_source'] = $arguments_source;
+		}
+
+		// Record transformation metadata when the schema was wrapped (matches tool behavior).
+		if ( null !== $transform && $transform['was_transformed'] && 'schema' === $arguments_source ) {
+			$adapter_meta['input_schema_transformed'] = true;
+			$adapter_meta['input_schema_wrapper']     = $transform['wrapper_property'];
+		}
+
+		// User-provided _meta from ability.meta.mcp._meta is carried as given.
+		if ( isset( $mcp_meta['_meta'] ) ) {
+			$prompt_data['_meta'] = $mcp_meta['_meta'];
+		}
+
+		return array(
+			'prompt_data'  => $prompt_data,
+			'adapter_meta' => $adapter_meta,
+		);
+	}
+
+	/**
+	 * Get explicit arguments from ability meta.mcp.arguments.
+	 *
+	 * Entries are carried as given and only re-indexed so the list serializes as a
+	 * JSON array. A value that is not an array is an error rather than a silent fall
+	 * back to input_schema conversion. An explicit null counts as not defined.
+	 *
+	 * @param array<string, mixed> $mcp The ability's `meta.mcp` block.
+	 * @return list<mixed>|\WP_Error|null Explicit arguments, WP_Error when set to a non-array, or null if not defined.
+	 * @since 0.5.0
+	 *
+	 */
+	private function get_explicit_arguments( array $mcp ) {
+		if ( ! isset( $mcp['arguments'] ) ) {
+			return null;
+		}
+
+		if ( ! is_array( $mcp['arguments'] ) ) {
+			return new WP_Error(
+				'mcp_prompt_invalid_arguments',
+				sprintf(
+				/* translators: %s: ability name */
+					__( 'Ability meta "mcp.arguments" must be an array for ability "%s".', 'mcp-adapter' ),
+					$this->ability->get_name()
+				)
+			);
+		}
+
+		return array_values( $mcp['arguments'] );
 	}
 
 	/**
@@ -131,7 +220,7 @@ class RegisterAbilityAsMcpPrompt {
 	 * {
 	 *   "type": "object",
 	 *   "properties": {
-	 *     "topic": {"type": "string", "description": "..."},
+	 *     "topic": {"type": "string", "title": "Topic", "description": "..."},
 	 *     "tone": {"type": "string", "description": "..."}
 	 *   },
 	 *   "required": ["topic"]
@@ -139,55 +228,107 @@ class RegisterAbilityAsMcpPrompt {
 	 *
 	 * To MCP prompt arguments format:
 	 * [
-	 *   {"name": "topic", "description": "...", "required": true},
-	 *   {"name": "tone", "description": "...", "required": false}
+	 *   {"name": "topic", "title": "Topic", "description": "...", "required": true},
+	 *   {"name": "tone", "description": "..."}
 	 * ]
 	 *
+	 * Every property becomes an argument named after its key, including a property
+	 * whose schema is a boolean rather than an object. `title` and `description` are
+	 * copied as given whenever set; the schema decides whether they fit. The
+	 * `required` list is only read as a lookup table, so it must be an array to
+	 * have any effect.
+	 *
+	 * Note: `required` is only emitted when true; optional arguments omit the field entirely.
+	 *
 	 * @param array<string,mixed> $input_schema The JSON Schema from ability.
-	 * @return array<int,array<string,mixed>> MCP-formatted arguments array.
+	 *
+	 * @return list<array<string, mixed>> Argument data list.
+	 * @since 0.5.0
+	 *
 	 */
 	private function convert_input_schema_to_arguments( array $input_schema ): array {
 		$arguments = array();
 
-		// Ensure we have properties to convert
+		// Ensure we have properties to convert.
 		if ( empty( $input_schema['properties'] ) || ! is_array( $input_schema['properties'] ) ) {
 			return $arguments;
 		}
 
-		// Get the list of required properties
+		// Get the list of required properties.
 		$required_fields = array();
 		if ( isset( $input_schema['required'] ) && is_array( $input_schema['required'] ) ) {
 			$required_fields = $input_schema['required'];
 		}
 
-		// Convert each property to an MCP argument
+		// Convert each property to an MCP argument.
 		foreach ( $input_schema['properties'] as $property_name => $property_schema ) {
-			if ( ! is_array( $property_schema ) ) {
-				continue;
-			}
+			$is_required = in_array( $property_name, $required_fields, true );
 
-			$argument = array(
-				'name'     => $property_name,
-				'required' => in_array( $property_name, $required_fields, true ),
+			$argument_data = array(
+				'name' => $property_name,
 			);
 
-			// Add description if available
-			if ( ! empty( $property_schema['description'] ) ) {
-				$argument['description'] = $property_schema['description'];
+			if ( is_array( $property_schema ) ) {
+				// Map JSON Schema title and description to the PromptArgument fields as given.
+				if ( isset( $property_schema['title'] ) ) {
+					$argument_data['title'] = $property_schema['title'];
+				}
+
+				if ( isset( $property_schema['description'] ) ) {
+					$argument_data['description'] = $property_schema['description'];
+				}
 			}
 
-			$arguments[] = $argument;
+			// Only emit required when true; omit for optional arguments.
+			if ( $is_required ) {
+				$argument_data['required'] = true;
+			}
+
+			$arguments[] = $argument_data;
 		}
 
 		return $arguments;
 	}
 
 	/**
-	 * Get the MCP prompt instance.
+	 * Resolve the MCP prompt name from ability.
 	 *
-	 * @return \WP\MCP\Domain\Prompts\McpPrompt|\WP_Error MCP prompt instance or WP_Error if validation fails.
+	 * Sanitizes the ability name to MCP-valid format, applies filter, and validates result.
+	 *
+	 * @since 0.5.0
+	 *
+	 * @return string|\WP_Error Valid prompt name or error.
 	 */
-	private function get_prompt() {
-		return McpPrompt::from_array( $this->get_data(), $this->mcp_server );
+	private function resolve_prompt_name() {
+		// Sanitize ability name to MCP-valid format.
+		$sanitized_name = McpNameSanitizer::sanitize_name( $this->ability->get_name() );
+
+		if ( is_wp_error( $sanitized_name ) ) {
+			return $sanitized_name;
+		}
+
+		/**
+		 * Filters the MCP prompt name derived from an ability.
+		 *
+		 * @since 0.5.0
+		 *
+		 * @param string      $name    The sanitized prompt name.
+		 * @param \WP_Ability $ability The source ability instance.
+		 */
+		$filtered_name = apply_filters( 'mcp_adapter_prompt_name', $sanitized_name, $this->ability );
+
+		// Validate post-filter (in case filter broke it).
+		if ( ! is_string( $filtered_name ) || ! McpValidator::validate_name( $filtered_name ) ) {
+			return new WP_Error(
+				'mcp_prompt_name_filter_invalid',
+				sprintf(
+					/* translators: %s: invalid prompt name returned by filter */
+					__( 'Filter returned invalid MCP prompt name: %s', 'mcp-adapter' ),
+					is_string( $filtered_name ) ? $filtered_name : gettype( $filtered_name )
+				)
+			);
+		}
+
+		return $filtered_name;
 	}
 }

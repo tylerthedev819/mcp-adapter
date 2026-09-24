@@ -1,6 +1,6 @@
 <?php
 /**
- * Factory class for creating MCP error responses.
+ * JSON-RPC and MCP protocol error factory.
  *
  * @package McpAdapter
  */
@@ -9,363 +9,341 @@ declare( strict_types=1 );
 
 namespace WP\MCP\Infrastructure\ErrorHandling;
 
+use WP\McpSchema\Schemas;
+
 /**
- * Factory for creating standardized MCP error responses.
+ * Builds logical JSON-RPC error arrays and maps error codes to HTTP status.
  *
- * This class provides static methods for creating various types of JSON-RPC
- * error responses according to the MCP specification.
+ * The wire orchestrator hydrates errors after schema selection. Early decoding
+ * or transport failures may serialize these arrays without schema hydration.
  */
 class McpErrorFactory {
 
-	/**
-	 * Standard JSON-RPC error codes as defined in the specification.
-	 */
 	public const PARSE_ERROR      = -32700;
 	public const INVALID_REQUEST  = -32600;
 	public const METHOD_NOT_FOUND = -32601;
 	public const INVALID_PARAMS   = -32602;
 	public const INTERNAL_ERROR   = -32603;
 
-	/**
-	 * Implementation-defined server error codes (in -32000 to -32099 range as per JSON-RPC spec).
-	 * Using conservative, well-established error codes only.
-	 */
-	public const SERVER_ERROR       = -32000; // Generic server error (includes MCP disabled)
-	public const TIMEOUT_ERROR      = -32001; // Request timeout
-	public const RESOURCE_NOT_FOUND = -32002; // Resource not found
-	public const TOOL_NOT_FOUND     = -32003; // Tool not found
-	public const PROMPT_NOT_FOUND   = -32004; // Prompt not found
-	public const PERMISSION_DENIED  = -32008; // Access denied/forbidden
-	public const UNAUTHORIZED       = -32010; // Authentication required
+	public const SERVER_ERROR        = -32000;
+	public const TIMEOUT_ERROR       = -32001;
+	public const RESOURCE_NOT_FOUND  = -32002;
+	public const TOOL_NOT_FOUND      = -32003;
+	public const PROMPT_NOT_FOUND    = -32004;
+	public const SESSION_NOT_FOUND   = -32005;
+	public const PERMISSION_DENIED   = -32008;
+	public const UNAUTHORIZED        = -32010;
+	public const HEADER_MISMATCH     = -32020;
+	public const MISSING_CAPABILITY  = -32021;
+	public const UNSUPPORTED_VERSION = -32022;
 
 	/**
-	 * Create a standardized JSON-RPC error response.
+	 * Build an error for malformed JSON.
 	 *
-	 * @param int    $id The request ID.
-	 * @param int    $code The error code.
-	 * @param string $message The error message.
-	 * @param mixed|null $data Optional additional error data.
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $details Optional diagnostic details appended to the base message.
 	 *
-	 * @return array
+	 * @return array<string, mixed> JSON-RPC error envelope.
 	 */
-	public static function create_error_response( int $id, int $code, string $message, $data = null ): array {
-		$response = array(
+	public static function parse_error( $id, string $details = '' ): array {
+		return self::create_error_response( $id, self::PARSE_ERROR, self::details( __( 'Parse error', 'mcp-adapter' ), $details ) );
+	}
+
+	/**
+	 * Wrap an error object in a JSON-RPC response envelope.
+	 *
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param int $code Protocol error code.
+	 * @param string $message Human-readable error message.
+	 * @param mixed $data Optional error data; omitted when null.
+	 *
+	 * @return array<string, mixed> Error envelope, not yet validated by a selected schema.
+	 */
+	public static function create_error_response( $id, int $code, string $message, $data = null ): array {
+		return array(
 			'jsonrpc' => '2.0',
 			'id'      => $id,
-			'error'   => array(
-				'code'    => $code,
-				'message' => $message,
-			),
+			'error'   => self::create_error( $code, $message, $data ),
 		);
+	}
 
+	/**
+	 * Build the error object used inside a JSON-RPC response.
+	 *
+	 * @param int $code Protocol error code.
+	 * @param string $message Human-readable error message.
+	 * @param mixed $data Optional error data; omitted when null.
+	 *
+	 * @return array<string, mixed> Error fields without a JSON-RPC envelope.
+	 */
+	public static function create_error( int $code, string $message, $data = null ): array {
+		$error = array(
+			'code'    => $code,
+			'message' => $message,
+		);
 		if ( null !== $data ) {
-			$response['error']['data'] = $data;
+			$error['data'] = $data;
 		}
 
-		return $response;
+		return $error;
 	}
 
 	/**
-	 * Create a parse error response.
+	 * Build an error for an unavailable method.
 	 *
-	 * @param int    $id The request ID.
-	 * @param string $details Optional additional details.
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $method Requested method.
 	 *
-	 * @return array
+	 * @return array<string, mixed> JSON-RPC error envelope.
 	 */
-	public static function parse_error( int $id, string $details = '' ): array {
-		$message = __( 'Parse error', 'mcp-adapter' );
-		if ( $details ) {
-			$message .= ': ' . $details;
-		}
-
-		return self::create_error_response( $id, self::PARSE_ERROR, $message );
+	public static function method_not_found( $id, string $method ): array {
+		/* translators: %s: method name. */
+		return self::create_error_response( $id, self::METHOD_NOT_FOUND, sprintf( __( 'Method not found: %s', 'mcp-adapter' ), $method ) );
 	}
 
 	/**
-	 * Create an invalid request error response.
+	 * Build an error for invalid method parameters.
 	 *
-	 * @param int    $id The request ID.
-	 * @param string $details Optional additional details.
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $details Optional diagnostic details appended to the base message.
 	 *
-	 * @return array
+	 * @return array<string, mixed> JSON-RPC error envelope.
 	 */
-	public static function invalid_request( int $id, string $details = '' ): array {
-		$message = __( 'Invalid Request', 'mcp-adapter' );
-		if ( $details ) {
-			$message .= ': ' . $details;
-		}
-
-		return self::create_error_response( $id, self::INVALID_REQUEST, $message );
+	public static function invalid_params( $id, string $details = '' ): array {
+		return self::create_error_response( $id, self::INVALID_PARAMS, self::details( __( 'Invalid params', 'mcp-adapter' ), $details ) );
 	}
 
 	/**
-	 * Create a method not found error response.
+	 * Build an error for an internal processing failure.
 	 *
-	 * @param int    $id The request ID.
-	 * @param string $method The method that was not found.
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $details Optional diagnostic details appended to the base message.
 	 *
-	 * @return array
+	 * @return array<string, mixed> JSON-RPC error envelope.
 	 */
-	public static function method_not_found( int $id, string $method ): array {
+	public static function internal_error( $id, string $details = '' ): array {
+		return self::create_error_response( $id, self::INTERNAL_ERROR, self::details( __( 'Internal error', 'mcp-adapter' ), $details ) );
+	}
+
+	/**
+	 * Build an error indicating that MCP functionality is disabled.
+	 *
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 *
+	 * @return array<string, mixed> JSON-RPC error envelope.
+	 */
+	public static function mcp_disabled( $id ): array {
+		return self::create_error_response( $id, self::SERVER_ERROR, __( 'MCP functionality is currently disabled', 'mcp-adapter' ) );
+	}
+
+	/**
+	 * Build an Invalid Params error describing validation failure.
+	 *
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $details Validation failure details.
+	 *
+	 * @return array<string, mixed> JSON-RPC error envelope.
+	 */
+	public static function validation_error( $id, string $details ): array {
+		/* translators: %s: validation details. */
+		return self::create_error_response( $id, self::INVALID_PARAMS, sprintf( __( 'Validation error: %s', 'mcp-adapter' ), $details ) );
+	}
+
+	/**
+	 * Build an Invalid Params error for a missing parameter.
+	 *
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $parameter Missing parameter name.
+	 *
+	 * @return array<string, mixed> JSON-RPC error envelope.
+	 */
+	public static function missing_parameter( $id, string $parameter ): array {
+		/* translators: %s: missing parameter name. */
+		return self::create_error_response( $id, self::INVALID_PARAMS, sprintf( __( 'Missing required parameter: %s', 'mcp-adapter' ), $parameter ) );
+	}
+
+	/**
+	 * Build the selected revision's error for an unavailable resource.
+	 *
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $resource_uri Requested resource URI.
+	 * @param string $revision Selected schema revision.
+	 *
+	 * @return array<string, mixed> Invalid Params for 2026, or Resource Not Found for the legacy schema.
+	 */
+	public static function resource_not_found( $id, string $resource_uri, string $revision ): array {
+		$code = Schemas::V2026_07_28 === $revision ? self::INVALID_PARAMS : self::RESOURCE_NOT_FOUND;
+		/* translators: %s: resource URI. */
+		return self::create_error_response( $id, $code, sprintf( __( 'Resource not found: %s', 'mcp-adapter' ), $resource_uri ), array( 'uri' => $resource_uri ) );
+	}
+
+	/**
+	 * Build an Invalid Params error for an unavailable tool.
+	 *
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $tool Requested tool name.
+	 *
+	 * @return array<string, mixed> JSON-RPC error envelope.
+	 */
+	public static function tool_not_found( $id, string $tool ): array {
+		/* translators: %s: tool name. */
+		return self::create_error_response( $id, self::INVALID_PARAMS, sprintf( __( 'Tool not found: %s', 'mcp-adapter' ), $tool ) );
+	}
+
+	/**
+	 * Build an error for a missing WordPress Ability.
+	 *
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $ability Requested WordPress Ability name.
+	 *
+	 * @return array<string, mixed> JSON-RPC error envelope.
+	 */
+	public static function ability_not_found( $id, string $ability ): array {
+		/* translators: %s: ability name. */
+		return self::create_error_response( $id, self::TOOL_NOT_FOUND, sprintf( __( 'Ability not found: %s', 'mcp-adapter' ), $ability ) );
+	}
+
+	/**
+	 * Build an Invalid Params error for an unavailable prompt.
+	 *
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $prompt Requested prompt name.
+	 *
+	 * @return array<string, mixed> JSON-RPC error envelope.
+	 */
+	public static function prompt_not_found( $id, string $prompt ): array {
+		/* translators: %s: prompt name. */
+		return self::create_error_response( $id, self::INVALID_PARAMS, sprintf( __( 'Prompt not found: %s', 'mcp-adapter' ), $prompt ) );
+	}
+
+	/**
+	 * Build an error for an unavailable legacy session.
+	 *
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $details Optional diagnostic details appended to the base message.
+	 *
+	 * @return array<string, mixed> JSON-RPC error envelope.
+	 */
+	public static function session_not_found( $id, string $details = '' ): array {
+		return self::create_error_response( $id, self::SESSION_NOT_FOUND, self::details( __( 'Session not found', 'mcp-adapter' ), $details ) );
+	}
+
+	/**
+	 * Build an error for denied access.
+	 *
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $details Optional diagnostic details appended to the base message.
+	 *
+	 * @return array<string, mixed> JSON-RPC error envelope.
+	 */
+	public static function permission_denied( $id, string $details = '' ): array {
+		return self::create_error_response( $id, self::PERMISSION_DENIED, self::details( __( 'Permission denied', 'mcp-adapter' ), $details ) );
+	}
+
+	/**
+	 * Build an error for missing or invalid authentication.
+	 *
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $details Optional diagnostic details appended to the base message.
+	 *
+	 * @return array<string, mixed> JSON-RPC error envelope.
+	 */
+	public static function unauthorized( $id, string $details = '' ): array {
+		return self::create_error_response( $id, self::UNAUTHORIZED, self::details( __( 'Unauthorized', 'mcp-adapter' ), $details ) );
+	}
+
+	/**
+	 * Build an error for an invalid JSON-RPC request.
+	 *
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $details Optional diagnostic details appended to the base message.
+	 *
+	 * @return array<string, mixed> JSON-RPC error envelope.
+	 */
+	public static function invalid_request( $id, string $details = '' ): array {
+		return self::create_error_response( $id, self::INVALID_REQUEST, self::details( __( 'Invalid Request', 'mcp-adapter' ), $details ) );
+	}
+
+	/**
+	 * Build a modern protocol header-mismatch error.
+	 *
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $details Missing or mismatched header details.
+	 *
+	 * @return array<string, mixed> JSON-RPC error envelope.
+	 */
+	public static function header_mismatch( $id, string $details ): array {
+		return self::create_error_response( $id, self::HEADER_MISMATCH, self::details( 'Header mismatch', $details ) );
+	}
+
+	/**
+	 * Build a modern unsupported-version error with supported alternatives.
+	 *
+	 * @param string|int|float|null $id Request identifier, or null when it cannot be determined.
+	 * @param string $requested Requested protocol identifier.
+	 * @param list<string> $supported Supported schema revision identifiers.
+	 *
+	 * @return array<string, mixed> Error envelope containing requested and supported versions.
+	 */
+	public static function unsupported_protocol_version( $id, string $requested, array $supported ): array {
 		return self::create_error_response(
 			$id,
-			self::METHOD_NOT_FOUND,
-			sprintf(
-				/* translators: %s: method name */
-				__( 'Method not found: %s', 'mcp-adapter' ),
-				$method
+			self::UNSUPPORTED_VERSION,
+			'Unsupported protocol version',
+			array(
+				'requested' => $requested,
+				'supported' => array_values( $supported ),
 			)
 		);
 	}
 
 	/**
-	 * Create an invalid params error response.
+	 * Map an error envelope using the default HTTP status policy.
 	 *
-	 * @param int    $id The request ID.
-	 * @param string $details Optional additional details.
+	 * Revision-specific overrides are applied by McpWireOrchestrator.
 	 *
-	 * @return array
+	 * @param mixed $error_response Logical error envelope.
+	 *
+	 * @return int HTTP status; 200 when no recognized error code is present.
 	 */
-	public static function invalid_params( int $id, string $details = '' ): array {
-		$message = __( 'Invalid params', 'mcp-adapter' );
-		if ( $details ) {
-			$message .= ': ' . $details;
-		}
-
-		return self::create_error_response( $id, self::INVALID_PARAMS, $message );
+	public static function get_http_status_for_error( $error_response ): int {
+		$code = is_array( $error_response ) ? ( $error_response['error']['code'] ?? 0 ) : 0;
+		return self::mcp_error_to_http_status( $code );
 	}
 
 	/**
-	 * Create an internal error response.
+	 * Map a protocol error code using the default HTTP status policy.
 	 *
-	 * @param int    $id The request ID.
-	 * @param string $details Optional additional details.
+	 * The orchestrator overrides Invalid Params to HTTP 400 for the 2026 revision.
 	 *
-	 * @return array
-	 */
-	public static function internal_error( int $id, string $details = '' ): array {
-		$message = __( 'Internal error', 'mcp-adapter' );
-		if ( $details ) {
-			$message .= ': ' . $details;
-		}
-
-		return self::create_error_response( $id, self::INTERNAL_ERROR, $message );
-	}
-
-	/**
-	 * Create an MCP disabled error response.
+	 * @param mixed $mcp_error_code Numeric protocol error code.
 	 *
-	 * @param int $id The request ID.
-	 *
-	 * @return array
-	 */
-	public static function mcp_disabled( int $id ): array {
-		return self::create_error_response(
-			$id,
-			self::SERVER_ERROR,
-			__( 'MCP functionality is currently disabled', 'mcp-adapter' )
-		);
-	}
-
-	/**
-	 * Create a validation error response (uses standard invalid params error).
-	 *
-	 * @param int    $id The request ID.
-	 * @param string $details Validation error details.
-	 *
-	 * @return array
-	 */
-	public static function validation_error( int $id, string $details ): array {
-		return self::create_error_response(
-			$id,
-			self::INVALID_PARAMS,
-			sprintf(
-				/* translators: %s: validation details */
-				__( 'Validation error: %s', 'mcp-adapter' ),
-				$details
-			)
-		);
-	}
-
-	/**
-	 * Create a missing parameter error response.
-	 *
-	 * @param int    $id The request ID.
-	 * @param string $parameter The missing parameter name.
-	 *
-	 * @return array
-	 */
-	public static function missing_parameter( int $id, string $parameter ): array {
-		return self::create_error_response(
-			$id,
-			self::INVALID_PARAMS,
-			sprintf(
-				/* translators: %s: parameter name */
-				__( 'Missing required parameter: %s', 'mcp-adapter' ),
-				$parameter
-			)
-		);
-	}
-
-	/**
-	 * Create a resource not found error response.
-	 *
-	 * @param int    $id The request ID.
-	 * @param string $resource_uri The resource identifier.
-	 *
-	 * @return array
-	 */
-	public static function resource_not_found( int $id, string $resource_uri ): array {
-		return self::create_error_response(
-			$id,
-			self::RESOURCE_NOT_FOUND,
-			sprintf(
-				/* translators: %s: resource identifier */
-				__( 'Resource not found: %s', 'mcp-adapter' ),
-				$resource_uri
-			)
-		);
-	}
-
-	/**
-	 * Create a tool not found error response.
-	 *
-	 * @param int    $id The request ID.
-	 * @param string $tool The tool name.
-	 *
-	 * @return array
-	 */
-	public static function tool_not_found( int $id, string $tool ): array {
-		return self::create_error_response(
-			$id,
-			self::TOOL_NOT_FOUND,
-			sprintf(
-				/* translators: %s: tool name */
-				__( 'Tool not found: %s', 'mcp-adapter' ),
-				$tool
-			)
-		);
-	}
-
-	/**
-	 * Create a tool not found error response.
-	 *
-	 * @param int    $id The request ID.
-	 * @param string $ability The tool name.
-	 *
-	 * @return array
-	 */
-	public static function ability_not_found( int $id, string $ability ): array {
-		return self::create_error_response(
-			$id,
-			self::TOOL_NOT_FOUND,
-			sprintf(
-				/* translators: %s: tool name */
-				__( 'Ability not found: %s', 'mcp-adapter' ),
-				$ability
-			)
-		);
-	}
-
-	/**
-	 * Create a prompt not found error response.
-	 *
-	 * @param int    $id The request ID.
-	 * @param string $prompt The prompt name.
-	 *
-	 * @return array
-	 */
-	public static function prompt_not_found( int $id, string $prompt ): array {
-		return self::create_error_response(
-			$id,
-			self::PROMPT_NOT_FOUND,
-			sprintf(
-				/* translators: %s: prompt name */
-				__( 'Prompt not found: %s', 'mcp-adapter' ),
-				$prompt
-			)
-		);
-	}
-
-	/**
-	 * Create a permission denied error response.
-	 *
-	 * @param int    $id The request ID.
-	 * @param string $details Optional additional details.
-	 *
-	 * @return array
-	 */
-	public static function permission_denied( int $id, string $details = '' ): array {
-		$message = __( 'Permission denied', 'mcp-adapter' );
-		if ( $details ) {
-			$message .= ': ' . $details;
-		}
-
-		return self::create_error_response( $id, self::PERMISSION_DENIED, $message );
-	}
-
-	/**
-	 * Create an unauthorized error response.
-	 *
-	 * @param int    $id The request ID.
-	 * @param string $details Optional additional details.
-	 *
-	 * @return array
-	 */
-	public static function unauthorized( int $id, string $details = '' ): array {
-		$message = __( 'Unauthorized', 'mcp-adapter' );
-		if ( $details ) {
-			$message .= ': ' . $details;
-		}
-
-		return self::create_error_response( $id, self::UNAUTHORIZED, $message );
-	}
-
-	/**
-	 * Translate MCP error code to appropriate HTTP status code.
-	 *
-	 * Maps JSON-RPC error codes to HTTP status codes according to best practices:
-	 * - Transport-level errors (malformed JSON-RPC) → HTTP 4xx
-	 * - Application-level errors (business logic) → HTTP 200 with JSON-RPC error
-	 *
-	 * @param int|string $mcp_error_code The MCP/JSON-RPC error code (integer or string).
-	 *
-	 * @return int The appropriate HTTP status code.
+	 * @return int HTTP status; unmapped codes and Invalid Params default to 200.
 	 */
 	public static function mcp_error_to_http_status( $mcp_error_code ): int {
-		// Handle integer error codes (existing logic)
-		switch ( $mcp_error_code ) {
-			// Transport-level errors - these indicate malformed requests
-			case self::PARSE_ERROR:      // Invalid JSON - syntactic error
+		$code = is_numeric( $mcp_error_code ) ? (int) $mcp_error_code : 0;
+		switch ( $code ) {
+			case self::PARSE_ERROR:
+			case self::INVALID_REQUEST:
+			case self::HEADER_MISMATCH:
+			case self::UNSUPPORTED_VERSION:
+			case self::MISSING_CAPABILITY:
 				return 400;
-
-			case self::INVALID_REQUEST:  // Invalid JSON-RPC structure - syntactic error
-				return 400;
-
-			// Authentication and authorization errors
-			case self::UNAUTHORIZED:     // Authentication required
+			case self::UNAUTHORIZED:
 				return 401;
-
-			case self::PERMISSION_DENIED: // Access forbidden
+			case self::PERMISSION_DENIED:
 				return 403;
-
-			// Resource not found errors
 			case self::RESOURCE_NOT_FOUND:
 			case self::TOOL_NOT_FOUND:
 			case self::PROMPT_NOT_FOUND:
+			case self::SESSION_NOT_FOUND:
 			case self::METHOD_NOT_FOUND:
 				return 404;
-
-			// Server errors
 			case self::INTERNAL_ERROR:
 			case self::SERVER_ERROR:
 				return 500;
-
 			case self::TIMEOUT_ERROR:
 				return 504;
-
-			// Application-level errors - return 200 with JSON-RPC error
 			case self::INVALID_PARAMS:
 			default:
 				return 200;
@@ -373,54 +351,14 @@ class McpErrorFactory {
 	}
 
 	/**
-	 * Determine if an MCP error should return HTTP 200 or an HTTP error status.
+	 * Append optional diagnostic details to a base message.
 	 *
-	 * This method helps distinguish between transport-level errors (which should
-	 * return HTTP error codes) and application-level errors (which should return
-	 * HTTP 200 with a JSON-RPC error response).
+	 * @param string $message Base message.
+	 * @param string $details Diagnostic details, or an empty string.
 	 *
-	 * @param array $error_response The MCP error response array.
-	 *
-	 * @return int The appropriate HTTP status code.
+	 * @return string Base message with non-empty details appended.
 	 */
-	public static function get_http_status_for_error( array $error_response ): int {
-		if ( ! isset( $error_response['error']['code'] ) ) {
-			return 500; // Invalid error response structure
-		}
-
-		return self::mcp_error_to_http_status( $error_response['error']['code'] );
-	}
-
-	/**
-	 * Validate JSON-RPC message structure.
-	 *
-	 * @param mixed $message The message to validate.
-	 *
-	 * @return bool|array Returns true if valid, or error array if invalid.
-	 */
-	public static function validate_jsonrpc_message( $message ) {
-		if ( ! is_array( $message ) ) {
-			return self::invalid_request( 0, __( 'Message must be a JSON object', 'mcp-adapter' ) );
-		}
-
-		// Must have jsonrpc field with value "2.0".
-		if ( ! isset( $message['jsonrpc'] ) || '2.0' !== $message['jsonrpc'] ) {
-			return self::invalid_request( 0, __( 'jsonrpc version must be "2.0"', 'mcp-adapter' ) );
-		}
-
-		// Must be either a request/notification (has method) or a response (has result/error).
-		$is_request_or_notification = isset( $message['method'] );
-		$is_response                = isset( $message['result'] ) || isset( $message['error'] );
-
-		if ( ! $is_request_or_notification && ! $is_response ) {
-			return self::invalid_request( 0, __( 'Message must have either method or result/error field', 'mcp-adapter' ) );
-		}
-
-		// Responses must have an id field.
-		if ( $is_response && ! isset( $message['id'] ) ) {
-			return self::invalid_request( 0, __( 'Response messages must have an id field', 'mcp-adapter' ) );
-		}
-
-		return true;
+	private static function details( string $message, string $details ): string {
+		return '' === $details ? $message : $message . ': ' . $details;
 	}
 }
